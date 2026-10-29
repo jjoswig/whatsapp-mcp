@@ -1,5 +1,6 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from mcp.server.fastmcp import FastMCP
+from read_only import READ_ONLY, READ_ONLY_MESSAGE
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
@@ -15,8 +16,35 @@ from whatsapp import (
     download_media as whatsapp_download_media
 )
 
-# Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+# New tools are denied by default until explicitly reviewed as read-only.
+READ_ONLY_TOOLS = frozenset({
+    "search_contacts", "list_messages", "list_chats", "get_chat",
+    "get_direct_chat_by_contact", "get_contact_chats", "get_last_interaction",
+    "get_message_context", "download_media",
+})
+
+
+class WhatsAppMCP(FastMCP):
+    def __init__(self, read_only: bool = READ_ONLY):
+        self._read_only = read_only
+        super().__init__("whatsapp")
+
+    def add_tool(
+        self, fn: Callable[..., Any], name: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> None:
+        if self._read_only and (name or fn.__name__) not in READ_ONLY_TOOLS:
+            return
+        super().add_tool(fn, name=name, description=description)
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]):
+        # Also reject explicit calls from clients with stale tool lists.
+        if self._read_only and name not in READ_ONLY_TOOLS:
+            raise ValueError(READ_ONLY_MESSAGE)
+        return await super().call_tool(name, arguments)
+
+
+mcp = WhatsAppMCP()
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:

@@ -203,7 +203,11 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func (b *bridge) sendWhatsAppMessage(recipient string, message string, mediaPath string) (bool, string) {
+	if b.readOnly {
+		return false, readOnlyMessage
+	}
+	client := b.client
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -675,10 +679,58 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+const readOnlyMessage = "WhatsApp writes are disabled (WHATSAPP_READ_ONLY=true)"
+
+// The policy is loaded once, before connecting, and cannot be changed over the API.
+func readOnlyFromEnv() (bool, error) {
+	value, set := os.LookupEnv("WHATSAPP_READ_ONLY")
+	if !set {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "1", "yes", "on":
+		return true, nil
+	case "false", "0", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid WHATSAPP_READ_ONLY: expected true/1/yes/on or false/0/no/off")
+	}
+}
+
+type bridge struct {
+	client       *whatsmeow.Client
+	messageStore *MessageStore
+	readOnly     bool
+}
+
+// Prevent automatic retransmission of outgoing messages by the WhatsApp library.
+// Configure this before connecting, since retry receipts arrive asynchronously.
+func (b *bridge) configureClient() {
+	if b.readOnly {
+		b.client.PreRetryCallback = func(_ *events.Receipt, _ types.MessageID, _ int, _ *waProto.Message) bool {
+			return false
+		}
+	}
+}
+
+// Only explicitly reviewed read operations may reach handlers in read-only mode.
+// Do not allow all GET requests: a future handler could mutate via any method.
+func (b *bridge) restrictWrites(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if b.readOnly && !(r.Method == http.MethodPost && r.URL.Path == "/api/download") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: readOnlyMessage})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (b *bridge) restHandler() http.Handler {
+	mux := http.NewServeMux()
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -706,7 +758,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := b.sendWhatsAppMessage(req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -724,7 +776,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -745,7 +797,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		// Download the media
-		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
+		success, mediaType, filename, path, err := downloadMedia(b.client, b.messageStore, req.MessageID, req.ChatJID)
 
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -773,23 +825,34 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Path:     path,
 		})
 	})
+	return b.restrictWrites(mux)
+}
 
+// Start a REST API server to expose the WhatsApp client functionality.
+func (b *bridge) startRESTServer(port int) {
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	handler := b.restHandler()
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.ListenAndServe(serverAddr, handler); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
 }
 
 func main() {
+	readOnly, err := readOnlyFromEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
+	logger.Infof("Read-only mode: %t", readOnly)
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
@@ -825,6 +888,9 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+
+	api := &bridge{client: client, readOnly: readOnly}
+	api.configureClient()
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
@@ -906,7 +972,8 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	api.messageStore = messageStore
+	api.startRESTServer(8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -1148,7 +1215,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 }
 
 // Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
+func (b *bridge) requestHistorySync() {
+	if b.readOnly {
+		fmt.Println(readOnlyMessage)
+		return
+	}
+	client := b.client
 	if client == nil {
 		fmt.Println("Client is not initialized. Cannot request history sync.")
 		return

@@ -16,6 +16,74 @@ Here's an example of what you can do when it's connected to Claude.
 
 ## Installation
 
+### Read-only mode (recommended for untrusted agents)
+
+Set **`WHATSAPP_READ_ONLY=true` on both the Go bridge and the Python MCP server**
+to disable WhatsApp write actions. Start the bridge from a trusted terminal:
+
+```bash
+cd whatsapp-bridge
+WHATSAPP_READ_ONLY=true go run main.go
+```
+
+In your MCP client's server configuration, pass the same setting to the Python
+process:
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "/absolute/path/to/uv",
+      "args": [
+        "--directory",
+        "/absolute/path/to/whatsapp-mcp/whatsapp-mcp-server",
+        "run",
+        "main.py"
+      ],
+      "env": {
+        "WHATSAPP_READ_ONLY": "true"
+      }
+    }
+  }
+}
+```
+
+Use the equivalent environment configuration when launching this MCP server from
+OpenClaw. The bridge is a separate process: setting the variable only in the MCP
+configuration does **not** make the bridge read-only. Set it on the bridge too,
+so direct HTTP requests cannot bypass the MCP restrictions. The bridge now listens
+on `127.0.0.1:8080`.
+
+With read-only mode enabled:
+
+- Text, file, and voice-message send tools are omitted from MCP discovery.
+  Explicit calls using cached tool names are also rejected. The Python send
+  helpers reject writes before HTTP requests, file checks, or audio conversion.
+- The bridge returns HTTP 403 with `success: false` for every request except the
+  explicitly allowed `POST /api/download` operation. Writes are blocked before
+  parsing request bodies, uploading media, or calling WhatsApp. The direct send
+  helper and the manual history-sync send helper are guarded as well. Automatic
+  retries of outgoing messages by the WhatsApp library are disabled.
+- Searching and reading stored contacts, chats, and messages, receiving history,
+  and downloading media remain available. These may update local caches. Reading
+  messages does not explicitly mark them as read or send typing/presence updates.
+- New MCP tools and bridge routes are denied by default until explicitly added
+  to the read allowlists. Replies, archiving, deleting messages, and changing group
+  membership have no tools or endpoints in this fork; adding such endpoints will
+  not make them accessible in read-only mode.
+
+The setting is read once at process startup. Restart both processes to change it;
+there is no tool or HTTP endpoint to enable writes. Values are case-insensitive
+and surrounding whitespace is ignored: `true`, `1`, `yes`, `on` enable read-only
+mode; `false`, `0`, `no`, `off` enable writes. An unset variable preserves the
+original writable behavior. An empty or invalid value prevents startup.
+
+This protects the MCP and bridge APIs. Authentication, synchronization, and
+WhatsApp's normal protocol acknowledgements still require outbound traffic. Keep
+the bridge process, configuration, code, and WhatsApp session files outside an
+untrusted agent's control: an agent with shell access to modify them or launch its
+own WhatsApp client can bypass an application-level setting.
+
 ### Prerequisites
 
 - Go
@@ -181,3 +249,22 @@ By default, just the metadata of the media is stored in the local database. The 
 - **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
+
+
+## Tests
+
+The tests use temporary databases, mocked requests, and local MCP sessions; they
+do not connect to a WhatsApp account or send real messages.
+
+```bash
+cd whatsapp-bridge
+go test -p 1 ./...
+```
+
+```bash
+cd whatsapp-mcp-server
+uv run --frozen python -m unittest discover -v
+```
+
+On a platform supported by Go's race detector, also run `go test -p 1 -race ./...`
+in `whatsapp-bridge`. Some ARM hosts cannot run ThreadSanitizer.

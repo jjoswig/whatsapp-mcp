@@ -6,6 +6,7 @@ import os.path
 import requests
 import json
 import audio
+from read_only import READ_ONLY, READ_ONLY_MESSAGE
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
@@ -623,6 +624,8 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             conn.close()
 
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+    if READ_ONLY:
+        return False, READ_ONLY_MESSAGE
     try:
         # Validate input
         if not recipient:
@@ -651,6 +654,8 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         return False, f"Unexpected error: {str(e)}"
 
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
+    if READ_ONLY:
+        return False, READ_ONLY_MESSAGE
     try:
         # Validate input
         if not recipient:
@@ -685,6 +690,8 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         return False, f"Unexpected error: {str(e)}"
 
 def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
+    if READ_ONLY:
+        return False, READ_ONLY_MESSAGE
     try:
         # Validate input
         if not recipient:
