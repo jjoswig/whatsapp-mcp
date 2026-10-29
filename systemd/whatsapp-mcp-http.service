@@ -1,0 +1,29 @@
+[Unit]
+Description=WhatsApp MCP Streamable HTTP gateway
+Wants=whatsapp-bridge.service
+After=whatsapp-bridge.service
+PartOf=whatsapp-mcp.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h/whatsapp-mcp/whatsapp-mcp-server
+Environment=WHATSAPP_READ_ONLY=true
+Environment=WHATSAPP_API_BASE_URL=http://127.0.0.1:8081/api
+Environment=WHATSAPP_MCP_HTTP_PORT=8000
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/.config/whatsapp-mcp/environment
+ExecStart=%h/.local/share/whatsapp-mcp-http/node_modules/.bin/supergateway \
+    --stdio "%h/whatsapp-mcp/whatsapp-mcp-server/.venv/bin/python %h/whatsapp-mcp/whatsapp-mcp-server/main.py" \
+    --outputTransport streamableHttp \
+    --host 127.0.0.1 \
+    --port ${WHATSAPP_MCP_HTTP_PORT} \
+    --streamableHttpPath /mcp
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+KillMode=control-group
+NoNewPrivileges=true
+UMask=0077
+StandardOutput=journal
+StandardError=journal

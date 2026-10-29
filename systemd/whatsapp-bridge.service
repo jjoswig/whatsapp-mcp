@@ -1,0 +1,19 @@
+[Unit]
+Description=WhatsApp read-only bridge
+PartOf=whatsapp-mcp.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h/whatsapp-mcp/whatsapp-bridge
+Environment=WHATSAPP_READ_ONLY=true
+Environment=WHATSAPP_BRIDGE_PORT=8081
+EnvironmentFile=-%h/.config/whatsapp-mcp/environment
+ExecStart=%h/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+KillMode=control-group
+NoNewPrivileges=true
+UMask=0077
+StandardOutput=journal
+StandardError=journal
