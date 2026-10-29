@@ -5,14 +5,17 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -829,19 +832,35 @@ func (b *bridge) restHandler() http.Handler {
 	return b.restrictWrites(mux)
 }
 
-// Start a REST API server to expose the WhatsApp client functionality.
-func (b *bridge) startRESTServer(port int) {
-	// Start the server
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
-	handler := b.restHandler()
+func bridgePortFromEnv() (int, error) {
+	value, set := os.LookupEnv("WHATSAPP_BRIDGE_PORT")
+	if !set {
+		return 8080, nil
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("invalid WHATSAPP_BRIDGE_PORT: expected a port between 1 and 65535")
+	}
+	return port, nil
+}
 
-	// Run server in a goroutine so it doesn't block
+// Reserve the address before opening session storage or connecting to WhatsApp.
+func openBridgeListener(port int) (net.Listener, error) {
+	address := fmt.Sprintf("127.0.0.1:%d", port)
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("cannot listen on %s: %w; set WHATSAPP_BRIDGE_PORT to an unused port", address, err)
+	}
+	return listener, nil
+}
+
+func (b *bridge) startRESTServer(listener net.Listener) (*http.Server, <-chan error) {
+	server := &http.Server{Handler: b.restHandler()}
+	result := make(chan error, 1)
 	go func() {
-		if err := http.ListenAndServe(serverAddr, handler); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
-		}
+		result <- server.Serve(listener)
 	}()
+	return server, result
 }
 
 // Refresh the advertised WhatsApp Web version instead of always using the
@@ -922,11 +941,26 @@ func waitForWhatsAppLogin(ctx context.Context, qrEvents <-chan whatsmeow.QRChann
 }
 
 func main() {
-	readOnly, err := readOnlyFromEnv()
-	if err != nil {
+	if err := runBridge(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func runBridge() error {
+	readOnly, err := readOnlyFromEnv()
+	if err != nil {
+		return err
+	}
+	port, err := bridgePortFromEnv()
+	if err != nil {
+		return err
+	}
+	listener, err := openBridgeListener(port)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -942,14 +976,12 @@ func main() {
 
 	// Create directory for database if it doesn't exist
 	if err := os.MkdirAll("store", 0755); err != nil {
-		logger.Errorf("Failed to create store directory: %v", err)
-		return
+		return fmt.Errorf("Failed to create store directory: %w", err)
 	}
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
-		logger.Errorf("Failed to connect to database: %v", err)
-		return
+		return fmt.Errorf("Failed to connect to database: %w", err)
 	}
 
 	defer container.Close()
@@ -962,16 +994,14 @@ func main() {
 			deviceStore = container.NewDevice()
 			logger.Infof("Created new device")
 		} else {
-			logger.Errorf("Failed to get device: %v", err)
-			return
+			return fmt.Errorf("Failed to get device: %w", err)
 		}
 	}
 
 	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
 	if client == nil {
-		logger.Errorf("Failed to create WhatsApp client")
-		return
+		return fmt.Errorf("failed to create WhatsApp client")
 	}
 
 	api := &bridge{client: client, readOnly: readOnly}
@@ -980,8 +1010,7 @@ func main() {
 	// Initialize message store
 	messageStore, err := NewMessageStore()
 	if err != nil {
-		logger.Errorf("Failed to initialize message store: %v", err)
-		return
+		return fmt.Errorf("Failed to initialize message store: %w", err)
 	}
 	defer messageStore.Close()
 
@@ -1013,8 +1042,7 @@ func main() {
 		logger.Infof("No linked session; waiting for a WhatsApp QR code...")
 		qrEvents, err = client.GetQRChannel(ctx)
 		if err != nil {
-			logger.Errorf("Failed to start QR pairing: %v", err)
-			return
+			return fmt.Errorf("Failed to start QR pairing: %w", err)
 		}
 	} else {
 		logger.Infof("Reconnecting existing WhatsApp session...")
@@ -1022,34 +1050,36 @@ func main() {
 
 	defer client.Disconnect()
 	if err := client.Connect(); err != nil {
-		logger.Errorf("Failed to connect: %v", err)
-		return
+		return fmt.Errorf("Failed to connect: %w", err)
 	}
 	if err := waitForWhatsAppLogin(ctx, qrEvents, startupResult, func(code string) {
 		fmt.Println("\nScan this QR code with your WhatsApp app:")
 		qrterminal.GenerateHalfBlock(code, qrterminal.L, os.Stdout)
 	}); err != nil {
-		logger.Errorf("WhatsApp startup failed: %v", err)
-		return
+		return fmt.Errorf("WhatsApp startup failed: %w", err)
 	}
 	cancel()
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
 	api.messageStore = messageStore
-	api.startRESTServer(8080)
+	server, serverResult := api.startRESTServer(listener)
+	defer server.Close()
+	fmt.Printf("REST API server listening on %s. Press Ctrl+C to disconnect and exit.\n", listener.Addr())
 
-	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
-
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
-
-	// Wait for termination signal
-	<-exitChan
-
-	fmt.Println("Disconnecting...")
+	defer signal.Stop(exitChan)
+	select {
+	case <-exitChan:
+		fmt.Println("Disconnecting...")
+		return nil
+	case err := <-serverResult:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("REST API server stopped: %w", err)
+		}
+		return nil
+	}
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info

@@ -174,6 +174,140 @@ Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
+## Run with systemd (Streamable HTTP)
+
+The [`systemd/`](./systemd/) profile runs two **user services**, controlled by one
+`whatsapp-mcp.target`. Run the installation commands as the account that owns and
+has paired the WhatsApp session (for example, `whatsapp-mcp`). The profile assumes
+the checkout is at `~/whatsapp-mcp`; `%h` in the units resolves to that user's home.
+Keep this account and its session files outside OpenClaw's control.
+
+The profile enables read-only mode in both processes. It uses bridge port **8081**
+to avoid conflicts with services already using 8080. The Streamable HTTP listener
+is at **`http://127.0.0.1:8000/mcp`**. Both listeners bind to loopback.
+
+### 1. Build and install dependencies
+
+Install Go 1.26+, a C compiler for SQLite, Python 3.11+, uv, and Node.js 20+ with
+npm. The profile uses [Supergateway 4.2.1](https://github.com/supercorp-ai/supergateway/releases/tag/v4.2.1)
+to expose the existing stdio MCP server over Streamable HTTP.
+
+```bash
+cd ~/whatsapp-mcp
+git pull --ff-only origin main
+(cd whatsapp-bridge && go build -o whatsapp-bridge .)
+(cd whatsapp-mcp-server && uv sync --frozen)
+npm install --prefix "$HOME/.local/share/whatsapp-mcp-http" supergateway@4.2.1
+```
+
+The services run the built Go binary and the project's Python virtual environment;
+they do not compile Go code or download dependencies each time they start.
+
+### 2. Pair once in a terminal
+
+Stop any manually running bridge or gateway first. Use the same account and
+checkout as the service, so the existing session in `whatsapp-bridge/store/` is
+reused. If you have not paired yet, scan the displayed QR code:
+
+```bash
+cd ~/whatsapp-mcp/whatsapp-bridge
+WHATSAPP_READ_ONLY=true WHATSAPP_BRIDGE_PORT=8081 ./whatsapp-bridge
+```
+
+Once authenticated and the REST listener is running, press **Ctrl+C**. Subsequent
+service starts reuse that session. To re-pair later, stop the target, run the
+command above in a terminal, then start the target again.
+
+### 3. Install and start the user services
+
+```bash
+cd ~/whatsapp-mcp
+install -d "$HOME/.config/systemd/user" "$HOME/.config/whatsapp-mcp"
+install -m 644 systemd/whatsapp-bridge.service \
+  systemd/whatsapp-mcp-http.service systemd/whatsapp-mcp.target \
+  "$HOME/.config/systemd/user/"
+install -m 600 systemd/whatsapp-mcp.env.example \
+  "$HOME/.config/whatsapp-mcp/environment"
+printf '\nPATH=%s\n' "$PATH" >> "$HOME/.config/whatsapp-mcp/environment"
+
+sudo loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now whatsapp-mcp.target
+```
+
+Capturing the current `PATH` makes Node installed through tools such as nvm
+available to systemd, which does not load your interactive shell profile. Refresh
+that `PATH` entry if you move or upgrade such a Node installation.
+
+[Lingering](https://www.freedesktop.org/software/systemd/man/latest/loginctl.html#enable-linger%20%5BUSER%E2%80%A6%5D)
+starts the user manager at boot and keeps the services running after logout. Use
+`systemctl --user` as the session owner, rather than running it with `sudo`. If the
+user bus is unavailable after switching accounts with `sudo`, open an SSH login
+as that account and run the commands there.
+
+### 4. Status, logs, restart, and stop
+
+```bash
+systemctl --user status whatsapp-mcp.target whatsapp-bridge.service whatsapp-mcp-http.service
+journalctl --user -u whatsapp-bridge.service -u whatsapp-mcp-http.service -f
+
+systemctl --user restart whatsapp-mcp.target
+systemctl --user stop whatsapp-mcp.target
+systemctl --user start whatsapp-mcp.target
+```
+
+Stopping or restarting the target also stops or restarts both services. Each
+service restarts after a failure. The bridge reports port conflicts before
+contacting WhatsApp and exits with a failure status, allowing systemd to detect
+failed startup. Its REST API starts serving only after authenticated login.
+
+To disable automatic startup and stop both services:
+
+```bash
+systemctl --user disable --now whatsapp-mcp.target
+```
+
+### Change ports or read-only mode
+
+Edit `~/.config/whatsapp-mcp/environment`, then restart the target. The installed
+example contains:
+
+```ini
+WHATSAPP_READ_ONLY=true
+WHATSAPP_BRIDGE_PORT=8081
+WHATSAPP_API_BASE_URL=http://127.0.0.1:8081/api
+WHATSAPP_MCP_HTTP_PORT=8000
+```
+
+When changing `WHATSAPP_BRIDGE_PORT`, also change the port in
+`WHATSAPP_API_BASE_URL`. Include `/api` in that URL. Change
+`WHATSAPP_MCP_HTTP_PORT` to move the gateway's `/mcp` endpoint. Both processes
+inherit `WHATSAPP_READ_ONLY`; keeping it `true` preserves the write restrictions.
+
+Outside systemd, the bridge's default port remains 8080. Set
+`WHATSAPP_BRIDGE_PORT` when starting the bridge and set `WHATSAPP_API_BASE_URL`
+when starting the Python MCP server or its gateway to select another address.
+
+### Update the installation
+
+```bash
+systemctl --user stop whatsapp-mcp.target
+cd ~/whatsapp-mcp
+git pull --ff-only origin main
+(cd whatsapp-bridge && go build -o whatsapp-bridge .)
+(cd whatsapp-mcp-server && uv sync --frozen)
+install -m 644 systemd/whatsapp-bridge.service \
+  systemd/whatsapp-mcp-http.service systemd/whatsapp-mcp.target \
+  "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user start whatsapp-mcp.target
+```
+
+Keep the existing environment file and `whatsapp-bridge/store/` when updating.
+If your checkout lives elsewhere, adjust `WorkingDirectory` and `ExecStart` in
+the installed units (including the Python paths in `--stdio`), then run
+`systemctl --user daemon-reload` and restart the target.
+
 ## Architecture Overview
 
 This application consists of two main components:

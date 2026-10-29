@@ -1,0 +1,6 @@
+[Unit]
+Description=WhatsApp bridge and MCP Streamable HTTP listener
+Wants=whatsapp-bridge.service whatsapp-mcp-http.service
+
+[Install]
+WantedBy=default.target

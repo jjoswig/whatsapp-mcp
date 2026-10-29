@@ -3,13 +3,28 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import os.path
+from urllib.parse import urlsplit
 import requests
 import json
 import audio
 from read_only import READ_ONLY, READ_ONLY_MESSAGE
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+def parse_bridge_api_base_url(value: Optional[str]) -> str:
+    if value is None:
+        return "http://127.0.0.1:8080/api"
+    value = value.strip().rstrip("/")
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme in {"http", "https"} and parsed.hostname
+                and parsed.port != 0 and not parsed.query and not parsed.fragment):
+            return value
+    except ValueError:
+        pass
+    raise ValueError("invalid WHATSAPP_API_BASE_URL: expected an absolute HTTP(S) URL without query or fragment")
+
+
+WHATSAPP_API_BASE_URL = parse_bridge_api_base_url(os.environ.get("WHATSAPP_API_BASE_URL"))
 
 @dataclass
 class Message:
