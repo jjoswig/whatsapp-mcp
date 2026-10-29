@@ -86,7 +86,7 @@ own WhatsApp client can bypass an application-level setting.
 
 ### Prerequisites
 
-- Go
+- Go 1.26 or newer (required by the updated WhatsApp library)
 - Python 3.6+
 - Anthropic Claude Desktop app (or Cursor)
 - UV (Python package manager), install with `curl -LsSf https://astral.sh/uv/install.sh | sh`
@@ -239,6 +239,25 @@ By default, just the metadata of the media is stored in the local database. The 
 
 - If you encounter permission issues when running uv, you may need to add it to your PATH or use the full path to the executable.
 - Make sure both the Go application and the Python server are running for the integration to work properly.
+
+### Connection and QR startup errors
+
+The bridge pins an updated whatsmeow release for current WhatsApp protocol support.
+It also refreshes its advertised WhatsApp Web version from the public
+`web.whatsapp.com` page before connecting (15-second HTTP timeout). If fetching
+fails, it logs a warning and uses the library's bundled version. A newer advertised
+version can resolve version rejection, but does not replace upgrading whatsmeow
+when WhatsApp changes its protocol.
+
+A `websocket: close 1006 ... unexpected EOF` line means the connection ended
+without a normal close frame; it does not identify the cause by itself. Read the
+following startup error and the logged client version. A `405`/outdated error
+means WhatsApp rejected the client version. Network restrictions and expired or
+replaced sessions can also stop login. The bridge reports terminal pairing and
+login failures, and applies a three-minute deadline even if no QR code arrives.
+It starts the REST API only after an authenticated `Connected` event, including
+when reconnecting a saved session. Read-only mode stays enabled during pairing
+and reconnection. Existing session and message databases are retained.
 
 ### Authentication Issues
 
